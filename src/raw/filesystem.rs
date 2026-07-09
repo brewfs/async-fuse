@@ -16,6 +16,18 @@ pub trait Filesystem {
     /// initialize filesystem. Called before any other filesystem method.
     async fn init(&self, req: Request) -> Result<ReplyInit>;
 
+    /// initialize filesystem with a kernel notification handle.
+    ///
+    /// The default implementation preserves the original `init` behavior for
+    /// filesystems that do not need to send invalidation or poll wakeup
+    /// notifications.
+    async fn init_with_notify(&self, req: Request, _notify: Notify) -> Result<ReplyInit>
+    where
+        Self: Sync,
+    {
+        self.init(req).await
+    }
+
     /// clean up filesystem. Called on filesystem exit which is fuseblk, in normal fuse filesystem,
     /// kernel may call forget for root. There is some discuss for this
     /// <https://github.com/bazil/fuse/issues/82#issuecomment-88126886>,

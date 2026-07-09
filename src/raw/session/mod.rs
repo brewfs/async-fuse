@@ -1605,7 +1605,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             reply_flags |= FUSE_XTIMES;
         }
 
-        let init_reply = match fs.init(request).await {
+        let init_reply = match fs.init_with_notify(request, self.get_notify()).await {
             Ok(reply) => reply,
             Err(err) => {
                 let init_out_header = fuse_out_header {
