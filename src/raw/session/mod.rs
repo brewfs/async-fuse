@@ -1546,7 +1546,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             reply_flags |= FUSE_HANDLE_KILLPRIV;
         }
 
-        if init_in.flags & FUSE_POSIX_ACL > 0 && self.mount_options.default_permissions {
+        if init_in.flags & FUSE_POSIX_ACL > 0 && self.mount_options.posix_acl {
             debug!("enable FUSE_POSIX_ACL");
 
             reply_flags |= FUSE_POSIX_ACL;
@@ -1605,7 +1605,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             reply_flags |= FUSE_XTIMES;
         }
 
-        let init_reply = match fs.init(request).await {
+        let init_reply = match fs.init_with_notify(request, self.get_notify()).await {
             Ok(reply) => reply,
             Err(err) => {
                 let init_out_header = fuse_out_header {
@@ -3524,7 +3524,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 let padding_size = get_padding_size(dir_entry_size);
 
                 // Check against max_size (entry_data portion only)
-                if data.len() - FUSE_OUT_HEADER_SIZE + dir_entry_size > max_size {
+                if data.len() - FUSE_OUT_HEADER_SIZE + dir_entry_size + padding_size > max_size {
                     break;
                 }
 
@@ -4528,7 +4528,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 let padding_size = get_padding_size(dir_entry_size);
 
                 // Check against max_size (entry_data portion only)
-                if data.len() - FUSE_OUT_HEADER_SIZE + dir_entry_size > max_size {
+                if data.len() - FUSE_OUT_HEADER_SIZE + dir_entry_size + padding_size > max_size {
                     break;
                 }
 

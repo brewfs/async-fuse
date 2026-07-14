@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-07-09
+
+### Added
+- asyncfuse: add `Filesystem::init_with_notify`, allowing raw filesystems to
+  capture a kernel notification handle during FUSE initialization while keeping
+  the original `init` method as the default behavior.
+
 ## 2026-02-24
 
 ### Fixed

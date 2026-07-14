@@ -46,6 +46,7 @@ pub struct MountOptions {
     pub(crate) no_open_support: bool,
     pub(crate) no_open_dir_support: bool,
     pub(crate) handle_killpriv: bool,
+    pub(crate) posix_acl: bool,
     pub(crate) write_back: bool,
     pub(crate) direct_io: bool,
     pub(crate) async_dio: bool,
@@ -92,6 +93,7 @@ impl Default for MountOptions {
             no_open_support: false,
             no_open_dir_support: false,
             handle_killpriv: false,
+            posix_acl: false,
             write_back: false,
             direct_io: false,
             async_dio: false,
@@ -169,6 +171,17 @@ impl MountOptions {
     /// [`path::access`]: crate::path::PathFilesystem::access
     pub fn default_permissions(&mut self, default_permissions: bool) -> &mut Self {
         self.default_permissions = default_permissions;
+
+        self
+    }
+
+    /// Advertise POSIX ACL support to the kernel, default is disabled.
+    ///
+    /// Filesystems enabling this must implement the system.posix_acl_* xattrs.
+    /// The kernel permission checks implied by `default_permissions` do not by
+    /// themselves mean that the filesystem supports POSIX ACLs.
+    pub fn posix_acl(&mut self, posix_acl: bool) -> &mut Self {
+        self.posix_acl = posix_acl;
 
         self
     }
@@ -495,5 +508,20 @@ impl MountOptions {
             flags.insert(MsFlags::MS_SYNCHRONOUS);
         }
         flags
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MountOptions;
+
+    #[test]
+    fn posix_acl_requires_explicit_opt_in() {
+        let mut options = MountOptions::default();
+        options.default_permissions(true);
+        assert!(!options.posix_acl);
+
+        options.posix_acl(true);
+        assert!(options.posix_acl);
     }
 }
