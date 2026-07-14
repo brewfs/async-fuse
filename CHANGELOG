@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.11 - 2026-07-14
+
+### Fixed
+- asyncfuse: make inode allocation, reuse, and path-bridge bookkeeping robust
+  under concurrent filesystem operations.
+
 ## 2026-07-09
 
 ### Added
