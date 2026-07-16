@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use bytes::Bytes;
-use futures_util::stream::{self, Stream, StreamExt};
+use futures_util::stream::{Stream, StreamExt};
 
 use super::inode_generator::InodeGenerator;
 use super::path_filesystem::PathFilesystem;
@@ -34,8 +34,233 @@ impl Name {
 mod tests {
     use super::*;
 
+    #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+    use std::time::{Duration, SystemTime};
+
+    #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+    use crate::path::reply as path_reply;
+
     fn name(value: &str) -> Name {
         Name::new(ROOT_INODE, OsString::from(value))
+    }
+
+    #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+    #[derive(Clone)]
+    struct CountingPathFilesystem {
+        fail_readdir: bool,
+        readdir_calls: Arc<AtomicUsize>,
+        readdir_polls: Arc<AtomicUsize>,
+        readdirplus_calls: Arc<AtomicUsize>,
+        readdirplus_polls: Arc<AtomicUsize>,
+    }
+
+    #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+    impl CountingPathFilesystem {
+        fn new() -> Self {
+            Self {
+                fail_readdir: false,
+                readdir_calls: Arc::new(AtomicUsize::new(0)),
+                readdir_polls: Arc::new(AtomicUsize::new(0)),
+                readdirplus_calls: Arc::new(AtomicUsize::new(0)),
+                readdirplus_polls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn with_failing_readdir() -> Self {
+            Self {
+                fail_readdir: true,
+                ..Self::new()
+            }
+        }
+    }
+
+    #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+    fn path_attr() -> path_reply::FileAttr {
+        path_reply::FileAttr {
+            size: 0,
+            blocks: 0,
+            atime: SystemTime::UNIX_EPOCH,
+            mtime: SystemTime::UNIX_EPOCH,
+            ctime: SystemTime::UNIX_EPOCH,
+            #[cfg(target_os = "macos")]
+            crtime: SystemTime::UNIX_EPOCH,
+            kind: crate::FileType::Directory,
+            perm: 0o755,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            #[cfg(target_os = "macos")]
+            flags: 0,
+            blksize: 4096,
+        }
+    }
+
+    #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+    impl PathFilesystem for CountingPathFilesystem {
+        async fn init(&self, _req: Request) -> Result<path_reply::ReplyInit> {
+            Ok(path_reply::ReplyInit::default())
+        }
+
+        async fn destroy(&self, _req: Request) {}
+
+        async fn readdir<'a>(
+            &'a self,
+            _req: Request,
+            _path: &'a OsStr,
+            _fh: u64,
+            _offset: i64,
+        ) -> Result<
+            path_reply::ReplyDirectory<
+                impl Stream<Item = Result<path_reply::DirectoryEntry>> + Send + 'a,
+            >,
+        > {
+            self.readdir_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_readdir {
+                return Err(libc::EIO.into());
+            }
+            let poll_count = Arc::clone(&self.readdir_polls);
+            let entries =
+                ["first", "second", "third"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        Ok(path_reply::DirectoryEntry {
+                            kind: crate::FileType::RegularFile,
+                            name: OsString::from(name),
+                            offset: (index + 1) as i64,
+                        })
+                    });
+
+            Ok(path_reply::ReplyDirectory {
+                entries: futures_util::stream::iter(entries).inspect(move |_| {
+                    poll_count.fetch_add(1, Ordering::SeqCst);
+                }),
+            })
+        }
+
+        async fn readdirplus<'a>(
+            &'a self,
+            _req: Request,
+            _path: &'a OsStr,
+            _fh: u64,
+            _offset: u64,
+            _lock_owner: u64,
+        ) -> Result<
+            path_reply::ReplyDirectoryPlus<
+                impl Stream<Item = Result<path_reply::DirectoryEntryPlus>> + Send + 'a,
+            >,
+        > {
+            self.readdirplus_calls.fetch_add(1, Ordering::SeqCst);
+            let poll_count = Arc::clone(&self.readdirplus_polls);
+            let entries =
+                ["first", "second", "third"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        Ok(path_reply::DirectoryEntryPlus {
+                            kind: crate::FileType::RegularFile,
+                            name: OsString::from(name),
+                            offset: (index + 1) as i64,
+                            attr: path_attr(),
+                            entry_ttl: Duration::ZERO,
+                            attr_ttl: Duration::ZERO,
+                        })
+                    });
+
+            Ok(path_reply::ReplyDirectoryPlus {
+                entries: futures_util::stream::iter(entries).inspect(move |_| {
+                    poll_count.fetch_add(1, Ordering::SeqCst);
+                }),
+            })
+        }
+    }
+
+    #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+    #[tokio::test]
+    async fn readdir_is_mapped_without_draining_the_path_stream() {
+        let path_filesystem = CountingPathFilesystem::new();
+        let bridge = InodePathBridge::new(path_filesystem.clone());
+        let reply = Filesystem::readdir(&bridge, Request::default(), ROOT_INODE, 0, 0)
+            .await
+            .expect("root directory should exist");
+
+        assert_eq!(path_filesystem.readdir_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(path_filesystem.readdir_polls.load(Ordering::SeqCst), 0);
+
+        let mut entries = Box::pin(reply.entries);
+        let first = entries
+            .as_mut()
+            .next()
+            .await
+            .expect("first entry")
+            .expect("successful entry");
+        assert_eq!(first.name, OsStr::new("first"));
+        assert_eq!(path_filesystem.readdir_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(path_filesystem.readdir_polls.load(Ordering::SeqCst), 1);
+
+        drop(entries);
+        assert_eq!(path_filesystem.readdir_polls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            bridge
+                .inode_name_manager
+                .inode_for_name(&Name::new(ROOT_INODE, OsString::from("second"))),
+            None
+        );
+    }
+
+    #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+    #[tokio::test]
+    async fn readdirplus_is_mapped_without_draining_the_path_stream() {
+        let path_filesystem = CountingPathFilesystem::new();
+        let bridge = InodePathBridge::new(path_filesystem.clone());
+        let reply = Filesystem::readdirplus(&bridge, Request::default(), ROOT_INODE, 0, 0, 0)
+            .await
+            .expect("root directory should exist");
+
+        assert_eq!(path_filesystem.readdirplus_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(path_filesystem.readdirplus_polls.load(Ordering::SeqCst), 0);
+
+        let mut entries = Box::pin(reply.entries);
+        let first = entries
+            .as_mut()
+            .next()
+            .await
+            .expect("first entry")
+            .expect("successful entry");
+        assert_eq!(first.name, OsStr::new("first"));
+        assert_eq!(first.attr.ino, first.inode);
+        assert_eq!(path_filesystem.readdirplus_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(path_filesystem.readdirplus_polls.load(Ordering::SeqCst), 1);
+
+        drop(entries);
+        assert_eq!(path_filesystem.readdirplus_polls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            bridge
+                .inode_name_manager
+                .inode_for_name(&Name::new(ROOT_INODE, OsString::from("second"))),
+            None
+        );
+    }
+
+    #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+    #[tokio::test]
+    async fn readdir_errors_are_yielded_lazily() {
+        let path_filesystem = CountingPathFilesystem::with_failing_readdir();
+        let bridge = InodePathBridge::new(path_filesystem.clone());
+        let reply = Filesystem::readdir(&bridge, Request::default(), ROOT_INODE, 0, 0)
+            .await
+            .expect("the lazy bridge stream is constructed before the path call");
+
+        assert_eq!(path_filesystem.readdir_calls.load(Ordering::SeqCst), 0);
+        let mut entries = Box::pin(reply.entries);
+        assert!(entries.as_mut().next().await.expect("error item").is_err());
+        assert_eq!(path_filesystem.readdir_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -953,41 +1178,40 @@ where
             .get_absolute_path(parent)
             .ok_or_else(Errno::new_not_exist)?;
 
-        let children = self
-            .path_filesystem
-            .readdir(req, parent_path.as_ref(), fh, offset)
-            .await?;
-
-        let entries = children.entries;
-        futures_util::pin_mut!(entries);
-
-        let entries_size = entries.size_hint().1.unwrap_or(0);
-        let mut entry_list = Vec::with_capacity(entries_size);
-
-        while let Some(entry) = entries.next().await {
-            let entry = entry?;
-
-            let inode = if entry.name == OsStr::new(".") {
-                parent
-            } else if entry.name == OsStr::new("..") {
-                self.inode_name_manager
-                    .get_parent_inode(parent)
-                    .unwrap_or(ROOT_INODE)
-            } else {
-                let name = Name::new(parent, entry.name.clone());
-                self.inode_name_manager.get_or_insert_inode(name)
-            };
-
-            entry_list.push(Ok(DirectoryEntry {
-                inode,
-                kind: entry.kind,
-                name: entry.name,
-                offset: entry.offset,
-            }));
-        }
-
+        // `PathFilesystem::readdir` may return a stream borrowing `parent_path`.
+        // Keep that path in this generator so entries can be mapped lazily instead
+        // of draining a stateful filesystem cursor before the session applies its
+        // kernel response-size limit.
         Ok(ReplyDirectory {
-            entries: stream::iter(entry_list),
+            entries: async_stream::try_stream! {
+                let children = self
+                    .path_filesystem
+                    .readdir(req, parent_path.as_ref(), fh, offset)
+                    .await?;
+                let entries = children.entries;
+                futures_util::pin_mut!(entries);
+
+                while let Some(entry) = entries.next().await {
+                    let entry = entry?;
+                    let inode = if entry.name == OsStr::new(".") {
+                        parent
+                    } else if entry.name == OsStr::new("..") {
+                        self.inode_name_manager
+                            .get_parent_inode(parent)
+                            .unwrap_or(ROOT_INODE)
+                    } else {
+                        self.inode_name_manager
+                            .get_or_insert_inode(Name::new(parent, entry.name.clone()))
+                    };
+
+                    yield DirectoryEntry {
+                        inode,
+                        kind: entry.kind,
+                        name: entry.name,
+                        offset: entry.offset,
+                    };
+                }
+            },
         })
     }
 
@@ -1229,48 +1453,40 @@ where
             .get_absolute_path(parent)
             .ok_or_else(Errno::new_not_exist)?;
 
-        let children = self
-            .path_filesystem
-            .readdirplus(req, parent_path.as_ref(), fh, offset, lock_owner)
-            .await?;
-
-        let entries = children.entries;
-        futures_util::pin_mut!(entries);
-
-        let entries_size = entries.size_hint().1.unwrap_or(0);
-        let mut entry_list = Vec::with_capacity(entries_size);
-
-        while let Some(entry) = entries.next().await {
-            let entry = entry?;
-
-            let inode = if entry.name == OsStr::new(".") {
-                parent
-            } else if entry.name == OsStr::new("..") {
-                self.inode_name_manager
-                    .get_parent_inode(parent)
-                    .unwrap_or(ROOT_INODE)
-            } else {
-                let name = Name::new(parent, entry.name.clone());
-                // The raw reply layer may stop before this eagerly collected
-                // entry fits in the kernel buffer. Do not add a lookup count
-                // until the path API can report which entries were emitted.
-                self.inode_name_manager.get_or_insert_inode(name)
-            };
-
-            entry_list.push(Ok(DirectoryEntryPlus {
-                inode,
-                generation: 0,
-                kind: entry.kind,
-                name: entry.name,
-                offset: entry.offset,
-                attr: (inode, entry.attr).into(),
-                entry_ttl: entry.entry_ttl,
-                attr_ttl: entry.attr_ttl,
-            }));
-        }
-
         Ok(ReplyDirectoryPlus {
-            entries: stream::iter(entry_list),
+            entries: async_stream::try_stream! {
+                let children = self
+                    .path_filesystem
+                    .readdirplus(req, parent_path.as_ref(), fh, offset, lock_owner)
+                    .await?;
+                let entries = children.entries;
+                futures_util::pin_mut!(entries);
+
+                while let Some(entry) = entries.next().await {
+                    let entry = entry?;
+                    let inode = if entry.name == OsStr::new(".") {
+                        parent
+                    } else if entry.name == OsStr::new("..") {
+                        self.inode_name_manager
+                            .get_parent_inode(parent)
+                            .unwrap_or(ROOT_INODE)
+                    } else {
+                        self.inode_name_manager
+                            .get_or_insert_inode(Name::new(parent, entry.name.clone()))
+                    };
+
+                    yield DirectoryEntryPlus {
+                        inode,
+                        generation: 0,
+                        kind: entry.kind,
+                        name: entry.name,
+                        offset: entry.offset,
+                        attr: (inode, entry.attr).into(),
+                        entry_ttl: entry.entry_ttl,
+                        attr_ttl: entry.attr_ttl,
+                    };
+                }
+            },
         })
     }
 
