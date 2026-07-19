@@ -96,6 +96,12 @@ use crate::helper::*;
 use crate::notify::Notify;
 use crate::raw::abi::*;
 use crate::raw::buffer_pool::AlignedBuffer;
+#[cfg(all(
+    feature = "buffer-pool",
+    not(feature = "async-io-runtime"),
+    feature = "tokio-runtime"
+))]
+use crate::raw::buffer_pool::BufferPool;
 #[cfg(any(
     feature = "async-io-runtime",
     feature = "tokio-runtime",
@@ -110,6 +116,44 @@ use crate::{MountOptions, SetAttr};
 
 #[cfg(target_os = "macos")]
 const MACFUSE_INIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[cfg(all(
+    feature = "buffer-pool",
+    not(feature = "async-io-runtime"),
+    feature = "tokio-runtime"
+))]
+struct PooledRequestBuffer {
+    buffer: Option<AlignedBuffer>,
+    pool: Arc<BufferPool>,
+    len: usize,
+}
+
+#[cfg(all(
+    feature = "buffer-pool",
+    not(feature = "async-io-runtime"),
+    feature = "tokio-runtime"
+))]
+impl AsRef<[u8]> for PooledRequestBuffer {
+    fn as_ref(&self) -> &[u8] {
+        &self
+            .buffer
+            .as_ref()
+            .expect("pooled request buffer already released")[..self.len]
+    }
+}
+
+#[cfg(all(
+    feature = "buffer-pool",
+    not(feature = "async-io-runtime"),
+    feature = "tokio-runtime"
+))]
+impl Drop for PooledRequestBuffer {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            self.pool.try_release(buffer);
+        }
+    }
+}
 
 #[cfg(target_os = "macos")]
 async fn wait_for_mount_init_ready(ready_rx: oneshot::Receiver<IoResult<()>>) -> IoResult<()> {
@@ -1023,6 +1067,15 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         // Create buffers for main loop (reused each iteration in legacy mode)
         let mut header_buffer = vec![0; FUSE_IN_HEADER_SIZE];
         let mut data_buffer = AlignedBuffer::try_new(buffer_size).map_err(IoError::other)?;
+        #[cfg(all(
+            feature = "buffer-pool",
+            not(feature = "async-io-runtime"),
+            feature = "tokio-runtime"
+        ))]
+        let request_buffer_pool = Arc::new(BufferPool::with_capacity(
+            buffer_size,
+            self.worker_count.saturating_mul(2).clamp(16, 128),
+        ));
 
         loop {
             if workers_active {
@@ -1120,9 +1173,28 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 let workers = self.workers.as_ref().expect("workers checked above");
                 let unique = request.unique;
                 let opcode_raw = in_header.opcode;
-                // Copy request payload into Bytes for worker.
-                // We must copy because data_buffer is reused for the next read.
+                #[cfg(not(all(
+                    feature = "buffer-pool",
+                    not(feature = "async-io-runtime"),
+                    feature = "tokio-runtime"
+                )))]
                 let body_bytes = Bytes::copy_from_slice(data_ref);
+                #[cfg(all(
+                    feature = "buffer-pool",
+                    not(feature = "async-io-runtime"),
+                    feature = "tokio-runtime"
+                ))]
+                let body_bytes = if opcode == fuse_opcode::FUSE_WRITE {
+                    let next_buffer = request_buffer_pool.acquire().await?;
+                    let request_buffer = std::mem::replace(&mut data_buffer, next_buffer);
+                    Bytes::from_owner(PooledRequestBuffer {
+                        buffer: Some(request_buffer),
+                        pool: request_buffer_pool.clone(),
+                        len: data_size,
+                    })
+                } else {
+                    Bytes::copy_from_slice(data_ref)
+                };
 
                 let lite = InHeaderLite {
                     nodeid: in_header.nodeid,

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.12 - 2026-07-19
+
+### Fixed
+- Reuse owned aligned buffers for worker-dispatched FUSE write payloads instead
+  of copying every request, while preserving the copy path for other requests
+  and non-Tokio runtimes.
+
 ## 0.1.11 - 2026-07-14
 
 ### Fixed
