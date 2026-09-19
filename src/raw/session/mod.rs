@@ -846,8 +846,23 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             // forgets the request (NotFound), or the channel is closed.
             let mut retry_delay_us: u64 = 100; // start at 100μs
             loop {
-                let ((ret_data, ret_ext), result) =
-                    fuse_connection.write_vectored(data, extend_data).await;
+                let ((ret_data, ret_ext), result) = {
+                    // The reply task is dedicated to replies and owns its own
+                    // dup'ed fd, so it writes straight to the kernel instead of
+                    // bouncing through the io_uring ring thread.
+                    #[cfg(feature = "io-uring-runtime")]
+                    {
+                        if direct_reply_disabled() {
+                            fuse_connection.write_vectored(data, extend_data).await
+                        } else {
+                            fuse_connection.write_vectored_blocking(data, extend_data)
+                        }
+                    }
+                    #[cfg(not(feature = "io-uring-runtime"))]
+                    {
+                        fuse_connection.write_vectored(data, extend_data).await
+                    }
+                };
                 match result {
                     Ok(_) => break,
                     Err(err) => {
@@ -4903,4 +4918,17 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             let _ = resp_sender.send(Either::Left(data)).await;
         });
     }
+}
+
+/// Replies are written straight from the dedicated reply task with a blocking
+/// `writev`, which is what libfuse does. Set `BREWFS_FUSE_DIRECT_REPLY=0` to
+/// fall back to the io_uring ring-thread reply path.
+#[allow(dead_code)]
+fn direct_reply_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("BREWFS_FUSE_DIRECT_REPLY")
+            .map(|value| matches!(value.trim(), "0" | "false" | "no" | "off" | ""))
+            .unwrap_or(false)
+    })
 }
