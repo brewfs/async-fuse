@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- asyncfuse: the io_uring connection no longer tears its ring thread down when
+  the submission queue is full. A request that cannot be submitted is answered
+  with a retryable error, so the mount survives instead of every later request
+  failing or hanging.
+- asyncfuse: the io_uring read and write slot tables are bounded and their
+  slots are recycled. The write table previously grew by one entry per
+  completed reply for as long as at least one reply stayed in flight, so a
+  continuously busy mount leaked memory without bound.
+- asyncfuse: `submit_and_wait` retries on `EINTR`, and when the ring really
+  fails it fails every outstanding request instead of leaving callers waiting
+  for a completion that can no longer arrive.
+
+### Changed
+- asyncfuse: the io_uring connection keeps up to `MAX_INFLIGHT_READS` (32)
+  `readv` operations in flight instead of exactly one. The session loop still
+  issues reads one at a time, but a cancelled or racing read can no longer block
+  every later read with `WouldBlock: read already inflight`.
+
 ## 0.1.12 - 2026-07-19
 
 ### Fixed

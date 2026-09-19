@@ -316,7 +316,15 @@ impl IoUringConnection {
 }
 
 /// User data tags for io_uring completions.
-const TAG_READ: u64 = 1;
+///
+/// Read completions carry their slot index in `[0, MAX_INFLIGHT_READS)`, write
+/// completions carry `TAG_WRITE_BASE + slot`, so the two ranges can never
+/// collide.
+const MAX_INFLIGHT_READS: usize = 32;
+/// Upper bound on outstanding `writev` replies. Replies are submitted from
+/// every worker task, so this is also the cap on reply memory the ring thread
+/// keeps alive on behalf of the workers.
+const MAX_INFLIGHT_WRITES: usize = 64;
 const TAG_WRITE_BASE: u64 = 0x1000;
 
 /// Pending read with its iovec storage kept alive.
@@ -336,19 +344,23 @@ struct InflightWrite {
 /// Processes read and write requests from a single channel, submitting them to
 /// the ring and waiting for completions. All iovec arrays are heap-allocated
 /// (Box) to ensure they remain at a stable address until the CQE arrives.
+///
+/// A request that cannot be submitted is reported back to its caller instead of
+/// taking the ring thread down: if this thread exits, no completion can arrive
+/// any more and every waiting caller blocks forever.
 fn ring_thread_main(fd: i32, mut rx: mpsc::Receiver<RingRequest>) -> io::Result<()> {
     let mut ring: IoUring = IoUring::builder().build(RING_SIZE)?;
 
-    let mut pending_read: Option<InflightRead> = None;
-    let mut pending_writes: Vec<Option<InflightWrite>> = Vec::new();
+    let mut pending_reads: SlotTable<InflightRead> = SlotTable::new(MAX_INFLIGHT_READS);
+    let mut pending_writes: SlotTable<InflightWrite> = SlotTable::new(MAX_INFLIGHT_WRITES);
 
-    let mut read_inflight = false;
+    let mut reads_inflight: usize = 0;
     let mut writes_inflight: usize = 0;
 
     loop {
         // If nothing is inflight, block until a request arrives.
         // Otherwise, drain the channel with try_recv.
-        let blocking = !read_inflight && writes_inflight == 0;
+        let blocking = reads_inflight == 0 && writes_inflight == 0;
 
         if blocking {
             match rx.blocking_recv() {
@@ -357,11 +369,11 @@ fn ring_thread_main(fd: i32, mut rx: mpsc::Receiver<RingRequest>) -> io::Result<
                     &mut ring,
                     fd,
                     req,
-                    &mut pending_read,
+                    &mut pending_reads,
                     &mut pending_writes,
-                    &mut read_inflight,
+                    &mut reads_inflight,
                     &mut writes_inflight,
-                )?,
+                ),
             }
         }
 
@@ -371,28 +383,41 @@ fn ring_thread_main(fd: i32, mut rx: mpsc::Receiver<RingRequest>) -> io::Result<
                 &mut ring,
                 fd,
                 req,
-                &mut pending_read,
+                &mut pending_reads,
                 &mut pending_writes,
-                &mut read_inflight,
+                &mut reads_inflight,
                 &mut writes_inflight,
-            )?;
+            );
         }
 
-        if !read_inflight && writes_inflight == 0 {
+        if reads_inflight == 0 && writes_inflight == 0 {
             continue;
         }
 
-        // Submit and wait for at least one completion
-        ring.submit_and_wait(1)?;
+        // Submit and wait for at least one completion.
+        //
+        // `io_uring_enter` returns EINTR for any signal the process receives;
+        // treating that as fatal would tear the mount down, so retry instead.
+        if let Err(err) = ring.submit_and_wait(1) {
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            // The ring is unusable. Fail every outstanding request so callers
+            // see an I/O error instead of blocking forever, then let this
+            // thread exit through the error path in `start_ring_thread`.
+            fail_pending(&mut pending_reads, &mut pending_writes, &err);
+            return Err(err);
+        }
 
         // Process completions
         for cqe in ring.completion() {
             let user_data = cqe.user_data();
             let result = cqe.result();
 
-            if user_data == TAG_READ {
-                read_inflight = false;
-                if let Some(inflight) = pending_read.take() {
+            if user_data < TAG_WRITE_BASE {
+                let idx = user_data as usize;
+                reads_inflight = reads_inflight.saturating_sub(1);
+                if let Some(inflight) = pending_reads.take(idx) {
                     let io_result = if result < 0 {
                         Err(io::Error::from_raw_os_error(-result))
                     } else {
@@ -403,10 +428,11 @@ fn ring_thread_main(fd: i32, mut rx: mpsc::Receiver<RingRequest>) -> io::Result<
                         .reply
                         .send(((inflight.req.header_buf, inflight.req.data_buf), io_result));
                 }
-            } else if user_data >= TAG_WRITE_BASE {
-                writes_inflight -= 1;
+                pending_reads.release(idx);
+            } else {
                 let idx = (user_data - TAG_WRITE_BASE) as usize;
-                if let Some(inflight) = pending_writes.get_mut(idx).and_then(|s| s.take()) {
+                writes_inflight = writes_inflight.saturating_sub(1);
+                if let Some(inflight) = pending_writes.take(idx) {
                     let io_result = if result < 0 {
                         Err(io::Error::from_raw_os_error(-result))
                     } else {
@@ -417,39 +443,129 @@ fn ring_thread_main(fd: i32, mut rx: mpsc::Receiver<RingRequest>) -> io::Result<
                         .reply
                         .send(((inflight.req.data, inflight.req.body_extend), io_result));
                 }
+                pending_writes.release(idx);
             }
-        }
-
-        // Compact pending_writes when all slots are done
-        if writes_inflight == 0 {
-            pending_writes.clear();
         }
     }
 }
 
+/// Fixed-capacity slot table with a free list.
+///
+/// Slots are created on demand up to `max` and recycled afterwards. A table
+/// that is only cleared once nothing is in flight grows without bound on a
+/// mount that always has at least one operation outstanding, so completed slots
+/// are reused instead.
+struct SlotTable<T> {
+    slots: Vec<Option<T>>,
+    free: Vec<usize>,
+    max: usize,
+}
+
+impl<T> SlotTable<T> {
+    fn new(max: usize) -> Self {
+        Self {
+            slots: Vec::with_capacity(max),
+            free: Vec::with_capacity(max),
+            max,
+        }
+    }
+
+    /// Reserve a slot, growing the table until it reaches `max`.
+    fn acquire(&mut self) -> Option<usize> {
+        if let Some(idx) = self.free.pop() {
+            return Some(idx);
+        }
+        if self.slots.len() < self.max {
+            self.slots.push(None);
+            return Some(self.slots.len() - 1);
+        }
+        None
+    }
+
+    /// Give a slot back after its value has been taken out with
+    /// [`SlotTable::take`].
+    fn release(&mut self, idx: usize) {
+        if let Some(slot) = self.slots.get_mut(idx) {
+            if slot.is_none() {
+                self.free.push(idx);
+            }
+        }
+    }
+
+    fn store(&mut self, idx: usize, value: T) {
+        self.slots[idx] = Some(value);
+    }
+
+    fn take(&mut self, idx: usize) -> Option<T> {
+        self.slots.get_mut(idx).and_then(|slot| slot.take())
+    }
+}
+
+/// Fail every outstanding request with the error that killed the ring.
+///
+/// The iovec arrays are leaked on purpose: the kernel may still be reading them
+/// while the ring is torn down, so freeing them here would hand the kernel a
+/// dangling pointer.
+fn fail_pending(
+    pending_reads: &mut SlotTable<InflightRead>,
+    pending_writes: &mut SlotTable<InflightWrite>,
+    err: &io::Error,
+) {
+    let raw = err.raw_os_error().unwrap_or(libc::EIO);
+    for slot in pending_reads
+        .slots
+        .iter_mut()
+        .filter_map(|slot| slot.take())
+    {
+        let _ = slot.req.reply.send((
+            (slot.req.header_buf, slot.req.data_buf),
+            Err(io::Error::from_raw_os_error(raw)),
+        ));
+        std::mem::forget(slot._iovecs);
+    }
+    pending_reads.free.clear();
+    for slot in pending_writes
+        .slots
+        .iter_mut()
+        .filter_map(|slot| slot.take())
+    {
+        let _ = slot.req.reply.send((
+            (slot.req.data, slot.req.body_extend),
+            Err(io::Error::from_raw_os_error(raw)),
+        ));
+        std::mem::forget(slot._iovecs);
+    }
+    pending_writes.free.clear();
+}
+
 /// Submit a single request (read or write) to the io_uring ring.
+///
+/// Never returns an error: a request that cannot be submitted is answered with
+/// a retryable error so the caller can submit it again, and the ring thread
+/// stays alive.
 fn submit_request(
     ring: &mut IoUring,
     fd: i32,
     req: RingRequest,
-    pending_read: &mut Option<InflightRead>,
-    pending_writes: &mut Vec<Option<InflightWrite>>,
-    read_inflight: &mut bool,
+    pending_reads: &mut SlotTable<InflightRead>,
+    pending_writes: &mut SlotTable<InflightWrite>,
+    reads_inflight: &mut usize,
     writes_inflight: &mut usize,
-) -> io::Result<()> {
+) {
     match req {
         RingRequest::Read(req) => {
-            if *read_inflight {
-                // Only one read at a time; reply with error
+            let Some(slot) = pending_reads.acquire() else {
+                // Every read slot is busy. Reply with a retryable error rather
+                // than stalling the ring thread.
                 let _ = req.reply.send((
                     (req.header_buf, req.data_buf),
                     Err(io::Error::new(
                         io::ErrorKind::WouldBlock,
-                        "read already inflight",
+                        "all in-flight read slots busy",
                     )),
                 ));
-                return Ok(());
-            }
+                return;
+            };
             let iovecs = Box::new([
                 libc::iovec {
                     iov_base: req.header_buf.as_ptr() as *mut libc::c_void,
@@ -462,19 +578,40 @@ fn submit_request(
             ]);
             let entry = opcode::Readv::new(types::Fd(fd), iovecs.as_ptr(), 2)
                 .build()
-                .user_data(TAG_READ);
-            unsafe {
-                ring.submission()
-                    .push(&entry)
-                    .map_err(|_| io::Error::other("SQ full"))?;
+                .user_data(slot as u64);
+            let pushed = unsafe { ring.submission().push(&entry) };
+            if pushed.is_err() {
+                // Keep the ring thread (and therefore the mount) alive: return
+                // the slot and let the caller retry this read.
+                pending_reads.release(slot);
+                let _ = req.reply.send((
+                    (req.header_buf, req.data_buf),
+                    Err(io::Error::other("submission queue full")),
+                ));
+                return;
             }
-            *pending_read = Some(InflightRead {
-                req,
-                _iovecs: iovecs,
-            });
-            *read_inflight = true;
+            pending_reads.store(
+                slot,
+                InflightRead {
+                    req,
+                    _iovecs: iovecs,
+                },
+            );
+            *reads_inflight += 1;
         }
         RingRequest::Write(req) => {
+            let Some(slot) = pending_writes.acquire() else {
+                // Replies are retried by the caller with backoff, so a full
+                // write table is recoverable.
+                let _ = req.reply.send((
+                    (req.data, req.body_extend),
+                    Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "all in-flight write slots busy",
+                    )),
+                ));
+                return;
+            };
             let iov_count;
             let iovecs = Box::new(match &req.body_extend {
                 None => {
@@ -505,21 +642,27 @@ fn submit_request(
                 }
             });
 
-            let idx = pending_writes.len();
             let entry = opcode::Writev::new(types::Fd(fd), iovecs.as_ptr(), iov_count)
                 .build()
-                .user_data(TAG_WRITE_BASE + idx as u64);
-            unsafe {
-                ring.submission()
-                    .push(&entry)
-                    .map_err(|_| io::Error::other("SQ full"))?;
+                .user_data(TAG_WRITE_BASE + slot as u64);
+            if unsafe { ring.submission().push(&entry) }.is_err() {
+                // Same contract as the read path: never take the ring thread
+                // down, let the reply retry loop resubmit.
+                pending_writes.release(slot);
+                let _ = req.reply.send((
+                    (req.data, req.body_extend),
+                    Err(io::Error::other("submission queue full")),
+                ));
+                return;
             }
-            pending_writes.push(Some(InflightWrite {
-                req,
-                _iovecs: iovecs,
-            }));
+            pending_writes.store(
+                slot,
+                InflightWrite {
+                    req,
+                    _iovecs: iovecs,
+                },
+            );
             *writes_inflight += 1;
         }
     }
-    Ok(())
 }
