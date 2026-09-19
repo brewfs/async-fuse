@@ -968,22 +968,26 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
     async fn read_fuse_request(
         &mut self,
         fuse_connection: &FuseConnection,
-        mut header_buffer: Vec<u8>,
-        mut data_buffer: AlignedBuffer,
+        header_buffer: Vec<u8>,
+        data_buffer: AlignedBuffer,
     ) -> ReadResult {
-        let res = match fuse_connection
+        match fuse_connection
             .read_vectored(header_buffer, data_buffer)
             .await
         {
             None => return ReadResult::Destroy,
 
             Some(((header_buf, data_buf), res)) => {
-                header_buffer = header_buf;
-                data_buffer = data_buf;
-
-                res
+                Self::finish_read_result(header_buf, data_buf, res)
             }
-        };
+        }
+    }
+
+    fn finish_read_result(
+        header_buffer: Vec<u8>,
+        data_buffer: AlignedBuffer,
+        res: std::io::Result<usize>,
+    ) -> ReadResult {
         let n = match res {
             Err(err) => {
                 if let Some(errno) = err.raw_os_error() {
@@ -1091,17 +1095,45 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             buffer_size,
             self.worker_count.saturating_mul(2).clamp(16, 128),
         ));
+        #[cfg(all(
+            feature = "buffer-pool",
+            not(feature = "async-io-runtime"),
+            feature = "tokio-runtime"
+        ))]
+        let mut preposted: Option<_> = None;
 
         loop {
-            if workers_active {
-                while self.inflight.load(Ordering::Acquire) >= self.max_background {
-                    self.inflight_notify.notified().await;
+            #[cfg(all(
+                feature = "buffer-pool",
+                not(feature = "async-io-runtime"),
+                feature = "tokio-runtime"
+            ))]
+            let read_result = if let Some(preposted) = preposted.take() {
+                let result = preposted.await;
+                match result {
+                    None => ReadResult::Destroy,
+                    Some(((header_buf, data_buf), res)) => {
+                        let retired_data = std::mem::replace(&mut data_buffer, data_buf);
+                        request_buffer_pool.try_release(retired_data);
+                        header_buffer = header_buf;
+                        Self::finish_read_result(header_buffer, data_buffer, res)
+                    }
                 }
-            }
-            let in_header = match self
+            } else {
+                self.read_fuse_request(&fuse_connection, header_buffer, data_buffer)
+                    .await
+            };
+
+            #[cfg(not(all(
+                feature = "buffer-pool",
+                not(feature = "async-io-runtime"),
+                feature = "tokio-runtime"
+            )))]
+            let read_result = self
                 .read_fuse_request(&fuse_connection, header_buffer, data_buffer)
-                .await
-            {
+                .await;
+
+            let in_header = match read_result {
                 ReadResult::Destroy => {
                     fs.destroy(Request {
                         unique: 0,
@@ -1129,6 +1161,12 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     }
                 }
             };
+
+            if workers_active {
+                while self.inflight.load(Ordering::Acquire) >= self.max_background {
+                    self.inflight_notify.notified().await;
+                }
+            }
 
             let request = Request::from(&in_header);
 
@@ -1234,6 +1272,21 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     data: body_bytes,
                     _inflight_guard: inflight_guard,
                 });
+
+                #[cfg(all(
+                    feature = "buffer-pool",
+                    not(feature = "async-io-runtime"),
+                    feature = "tokio-runtime"
+                ))]
+                if workers_active
+                    && opcode == fuse_opcode::FUSE_READ
+                    && preposted.is_none()
+                    && prepost_read_enabled()
+                {
+                    let next_header = std::mem::take(&mut header_buffer);
+                    let next_data = request_buffer_pool.acquire().await?;
+                    preposted = Some(fuse_connection.read_vectored(next_header, next_data));
+                }
             } else {
                 // Will concurrency in a single-threaded context cause disorder in the sequence of operations on a single file?
                 match opcode {
@@ -4929,6 +4982,26 @@ fn direct_reply_disabled() -> bool {
     *DISABLED.get_or_init(|| {
         std::env::var("BREWFS_FUSE_DIRECT_REPLY")
             .map(|value| matches!(value.trim(), "0" | "false" | "no" | "off" | ""))
+            .unwrap_or(false)
+    })
+}
+
+/// Opt into FUSE read pre-posting with `ASYNCFUSE_PREPOST_READ=1`.
+///
+/// Pre-posting overlaps the next kernel read submission with handler execution
+/// and helps sequential reads, but focused BrewFS A/B runs showed a bigread and
+/// randread regression. Keep it opt-in until request routing can choose this
+/// behavior per workload.
+#[cfg(all(
+    feature = "buffer-pool",
+    not(feature = "async-io-runtime"),
+    feature = "tokio-runtime"
+))]
+fn prepost_read_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ASYNCFUSE_PREPOST_READ")
+            .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
             .unwrap_or(false)
     })
 }
