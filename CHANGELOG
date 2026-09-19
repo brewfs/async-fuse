@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.13 - 2026-09-19
 
 ### Fixed
 - asyncfuse: the io_uring connection no longer tears its ring thread down when
