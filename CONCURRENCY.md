@@ -124,6 +124,12 @@ WorkItem
   ├─ in_header: InHeaderLite (避免 move 原始 header)
   └─ data: Vec<u8>  (请求体拷贝)
   └─ _inflight_guard: InflightGuard (自动管理计数，一个请求对应一个计数)
+
+FuseConnection (io-uring-runtime)
+  ├─ tx: mpsc::Sender<RingRequest>       (会话线程 → ring 线程)
+  ├─ ring 线程: 单线程 io_uring 循环，负责 readv/writev /dev/fuse
+  ├─ pending_reads: SlotTable<InflightRead>   (容量 MAX_INFLIGHT_READS)
+  └─ pending_writes: SlotTable<InflightWrite> (容量 MAX_INFLIGHT_WRITES)
 ```
 
 ## 生命周期
@@ -163,6 +169,8 @@ WorkItem
 3. 背压阈值策略：目前简单阈值；可加二级阈值（软/硬）或自适应（基于平均执行时间估计）。
 4. READDIR 构造目录项缓冲多次 push + padding，可考虑自定义 writer 减少重复 bounds 检查。
 5. 未来 interrupt：需要建立 `Arc<Mutex<HashMap<u64, AbortHandle>>>`，在 submit 增加记录，在完成/错误时清除。
+6. io_uring 读路径目前是"取一条、派一条"：`dispatch()` 必须等到本次 `readv` 的 CQE 才能拿到下一条请求，因此每条请求都暴露一次 ring 往返（channel + 线程唤醒 + `io_uring_enter` + CQE）。连接层已经允许 `MAX_INFLIGHT_READS` 个 readv 同时在飞，后续可让 `dispatch()` 预先投递下一次读（配合 buffer-pool 的缓冲区），把这段延迟与 worker 处理重叠。
+7. `read_vectored()` 在 `select!` 命中 unmount 分支时会丢弃仍在飞的 read，缓冲区所有权回到调用方，而内核可能仍在向其中写入（readv 的 iovec 指向调用方提供的 buffer）。后续可让连接层持有读缓冲区（例如 ring 线程持有的池），消除这个悬垂写窗口。
 
 ## 代码热区索引
 - 结构体与核心逻辑：`src/raw/session.rs`
@@ -189,6 +197,9 @@ session.mount(fs, mount_point).await?;
 - [ ] WorkItem 零拷贝优化
 - [x] Inline opcode 统一纳入 inflight 或全部迁移
 - [ ] 指标/监控：当前 in_flight，高水位阻塞次数
+- [x] io_uring 连接层 slot 管理：读写 slot 有界且复用，SQ 满不再杀死 ring 线程
+- [ ] 读路径预投递（read pipeline），重叠 ring 往返延迟
+- [ ] 读缓冲区改由连接层持有，消除取消读时的悬垂写窗口
 
 ## 风险与测试建议
 - 测试高并发小文件创建/读取的稳定性（LOOKUP/OPEN/READ/WRITE 路径）。
