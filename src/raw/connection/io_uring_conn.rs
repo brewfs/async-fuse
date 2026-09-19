@@ -296,6 +296,90 @@ impl FuseConnection {
             ),
         }
     }
+
+    /// Write a FUSE response with a direct blocking `writev` on `/dev/fuse`.
+    ///
+    /// Each reply task owns a dedicated dup'ed fd and has nothing else to do
+    /// while a reply is in flight, so it can afford the (rare) block. Skipping
+    /// the ring thread removes an mpsc hop, two thread wakeups and one
+    /// `io_uring_enter` from every single reply, which is worth ~70us per reply
+    /// on the BrewFS compose read baseline.
+    ///
+    /// Returns the same shape as [`Self::write_vectored`] so callers can share
+    /// their retry loop and buffer hand-back logic.
+    #[cfg(target_os = "linux")]
+    pub fn write_vectored_blocking(
+        &self,
+        data: Bytes,
+        body_extend_data: Option<Bytes>,
+    ) -> CompleteIoResult<(Bytes, Option<Bytes>), usize> {
+        let extend = body_extend_data.as_ref().filter(|buf| !buf.is_empty());
+        let mut iov: [libc::iovec; 2] = [
+            libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            },
+            libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            },
+        ];
+        let mut iov_count = 0usize;
+        if !data.is_empty() {
+            iov[iov_count] = libc::iovec {
+                iov_base: data.as_ptr() as *mut libc::c_void,
+                iov_len: data.len(),
+            };
+            iov_count += 1;
+        }
+        if let Some(extend) = extend {
+            iov[iov_count] = libc::iovec {
+                iov_base: extend.as_ptr() as *mut libc::c_void,
+                iov_len: extend.len(),
+            };
+            iov_count += 1;
+        }
+        if iov_count == 0 {
+            return ((data, body_extend_data), Ok(0));
+        }
+
+        let total = iov[..iov_count]
+            .iter()
+            .map(|entry| entry.iov_len)
+            .sum::<usize>();
+
+        loop {
+            let written = unsafe { libc::writev(self.inner.fd, iov.as_ptr(), iov_count as i32) };
+            if written >= 0 {
+                let written = written as usize;
+                if written != total {
+                    // The kernel either consumes a whole FUSE reply or rejects
+                    // it, so a short write must not be treated as success.
+                    return (
+                        (data, body_extend_data),
+                        Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            format!("short fuse reply write: {written} of {total} bytes"),
+                        )),
+                    );
+                }
+                return ((data, body_extend_data), Ok(written));
+            }
+
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                // The kernel forgot the request (interrupted or aborted).
+                Some(libc::ENOENT) => {
+                    return (
+                        (data, body_extend_data),
+                        Err(io::Error::from(io::ErrorKind::NotFound)),
+                    );
+                }
+                _ => return ((data, body_extend_data), Err(err)),
+            }
+        }
+    }
 }
 
 impl IoUringConnection {

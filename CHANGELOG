@@ -2,6 +2,9 @@
 
 ## 0.1.13 - 2026-09-19
 
+### Changed
+- asyncfuse: FUSE replies are written straight from the dedicated reply task with a blocking ``writev`` on that task's own ``/dev/fuse`` fd instead of being handed to the io_uring ring thread. This removes an mpsc hop, two thread wakeups and one ``io_uring_enter`` per reply (measured ~70us off each reply; +27% fio-randread and +25% fio-randrw throughput on the BrewFS compose baseline, neutral for serial seqread). Set ``BREWFS_FUSE_DIRECT_REPLY=0`` to fall back to the ring-thread path.
+
 ### Fixed
 - asyncfuse: the io_uring connection no longer tears its ring thread down when
   the submission queue is full. A request that cannot be submitted is answered
